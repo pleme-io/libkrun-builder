@@ -18,10 +18,12 @@
   boot.loader.efi.canTouchEfiVariables = true;
 
   # Rosetta 2 binfmt registration — run x86_64 ELF binaries via Rosetta
+  # Rosetta runtime is mounted from host macOS via virtiofs at /run/rosetta
   boot.binfmt.registrations.rosetta = {
     interpreter = "/run/rosetta/rosetta";
     fixBinary = true;
-    matchType = "magic";
+    wrapInterpreterInShell = false;
+    recognitionType = "magic";
     magicOrExtension = ''\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00'';
     mask = ''\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff'';
   };
