@@ -49,7 +49,6 @@ in {
 
     package = mkOption {
       type = types.package;
-      default = pkgs.libkrun-builder;
       description = "The libkrun-builder package.";
     };
   };
