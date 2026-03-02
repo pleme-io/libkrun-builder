@@ -88,8 +88,16 @@
   };
 
   # --- Disk image ---
-  virtualisation = {
-    diskSize = 80 * 1024; # 80 GiB
+  # Wire make-disk-image.nix into system.build.diskImage
+  # qemu-vm's virtualisation.diskSize only affects ephemeral runtime disks
+  system.build.diskImage = import "${pkgs.path}/nixos/lib/make-disk-image.nix" {
+    inherit config lib pkgs;
+    format = "qcow2";
+    partitionTableType = "efi";
+    diskSize = "auto";
+    additionalSpace = "2048M";
+    installBootLoader = true;
+    copyChannel = false;
   };
 
   # Minimal system — no docs, no GUI
