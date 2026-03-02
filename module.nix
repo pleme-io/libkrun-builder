@@ -93,18 +93,18 @@ in {
           LIBKRUN_CORES = toString cfg.cores;
           LIBKRUN_MEMORY = cfg.memory;
           LIBKRUN_SSH_PORT = toString cfg.sshPort;
+          # PATH: krunkit, gvproxy, openssh, coreutils, /usr/bin (codesign)
+          PATH = lib.makeBinPath [
+            pkgs.krunkit
+            pkgs.gvproxy
+            pkgs.openssh
+            pkgs.coreutils
+          ] + ":/usr/bin";
         };
         ProgramArguments = [
           "${cfg.package}/bin/libkrun-builder"
           "start"
         ];
-        # PATH: krunkit, gvproxy, openssh, coreutils, /usr/bin (codesign)
-        PATH = lib.makeBinPath [
-          pkgs.krunkit
-          pkgs.gvproxy
-          pkgs.openssh
-          pkgs.coreutils
-        ] + ":/usr/bin";
       };
     };
 
