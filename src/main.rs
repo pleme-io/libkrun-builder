@@ -1,4 +1,7 @@
 use anyhow::{bail, Context, Result};
+use figment::providers::{Env, Format, Serialized, Yaml};
+use figment::Figment;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -8,66 +11,90 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn work_dir() -> PathBuf {
-    PathBuf::from(env::var("LIBKRUN_WORKDIR").unwrap_or_else(|_| "/var/lib/libkrun-builder".into()))
+#[derive(Debug, Deserialize, Serialize)]
+struct Config {
+    image: String,
+    workdir: String,
+    cores: u32,
+    memory: String,
+    ssh_port: u16,
 }
 
-fn ssh_port() -> u16 {
-    env::var("LIBKRUN_SSH_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(31122)
-}
-
-fn cores() -> u32 {
-    env::var("LIBKRUN_CORES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(6)
-}
-
-fn memory() -> u32 {
-    let raw = env::var("LIBKRUN_MEMORY").unwrap_or_else(|_| "8192".into());
-    // Accept plain number (MiB) or strings like "8GiB"/"8192MiB"
-    if let Ok(n) = raw.parse::<u32>() {
-        return n;
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            image: String::new(),
+            workdir: "/var/lib/libkrun-builder".into(),
+            cores: 6,
+            memory: "8GiB".into(),
+            ssh_port: 31122,
+        }
     }
-    let lower = raw.to_lowercase();
-    if let Some(s) = lower.strip_suffix("gib") {
-        return s.trim().parse::<u32>().unwrap_or(8192) * 1024;
-    }
-    if let Some(s) = lower.strip_suffix("mib") {
-        return s.trim().parse::<u32>().unwrap_or(8192);
-    }
-    8192
 }
 
-fn image_path() -> Result<PathBuf> {
-    let p = env::var("LIBKRUN_IMAGE").context("LIBKRUN_IMAGE env var is required")?;
-    let path = PathBuf::from(&p);
-    if !path.exists() {
-        bail!("Guest image not found: {p}");
+impl Config {
+    fn load() -> Result<Self> {
+        let config_path = env::var("LIBKRUN_CONFIG")
+            .unwrap_or_else(|_| "/etc/libkrun-builder/config.yaml".into());
+
+        // Figment: defaults → YAML config file → env vars (LIBKRUN_ prefix)
+        let cfg: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Yaml::file(&config_path))
+            .merge(Env::prefixed("LIBKRUN_"))
+            .extract()
+            .context("Failed to load configuration")?;
+
+        Ok(cfg)
     }
-    Ok(path)
+
+    fn memory_mib(&self) -> u32 {
+        // Accept plain number (MiB) or strings like "8GiB"/"8192MiB"
+        if let Ok(n) = self.memory.parse::<u32>() {
+            return n;
+        }
+        let lower = self.memory.to_lowercase();
+        if let Some(s) = lower.strip_suffix("gib") {
+            return s.trim().parse::<u32>().unwrap_or(8192) * 1024;
+        }
+        if let Some(s) = lower.strip_suffix("mib") {
+            return s.trim().parse::<u32>().unwrap_or(8192);
+        }
+        8192
+    }
+
+    fn image_path(&self) -> Result<PathBuf> {
+        if self.image.is_empty() {
+            bail!("'image' is required (set via config file or LIBKRUN_IMAGE env var)");
+        }
+        let path = PathBuf::from(&self.image);
+        if !path.exists() {
+            bail!("Guest image not found: {}", self.image);
+        }
+        Ok(path)
+    }
+
+    fn work_dir(&self) -> PathBuf {
+        PathBuf::from(&self.workdir)
+    }
 }
 
-fn pid_path(name: &str) -> PathBuf {
-    work_dir().join(format!("{name}.pid"))
+fn pid_path(cfg: &Config, name: &str) -> PathBuf {
+    cfg.work_dir().join(format!("{name}.pid"))
 }
 
-fn read_pid(name: &str) -> Option<u32> {
-    fs::read_to_string(pid_path(name))
+fn read_pid(cfg: &Config, name: &str) -> Option<u32> {
+    fs::read_to_string(pid_path(cfg, name))
         .ok()
         .and_then(|s| s.trim().parse().ok())
 }
 
-fn write_pid(name: &str, pid: u32) -> Result<()> {
-    fs::write(pid_path(name), pid.to_string())?;
+fn write_pid(cfg: &Config, name: &str, pid: u32) -> Result<()> {
+    fs::write(pid_path(cfg, name), pid.to_string())?;
     Ok(())
 }
 
 fn is_running(pid: u32) -> bool {
-    // kill -0 checks process existence without sending a signal
     Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stdout(Stdio::null())
@@ -76,8 +103,8 @@ fn is_running(pid: u32) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-fn ensure_ssh_keys() -> Result<()> {
-    let dir = work_dir();
+fn ensure_ssh_keys(cfg: &Config) -> Result<()> {
+    let dir = cfg.work_dir();
     let key = dir.join("ssh_host_ed25519_key");
     if key.exists() {
         eprintln!("SSH keys already exist");
@@ -103,28 +130,29 @@ fn ensure_ssh_keys() -> Result<()> {
     Ok(())
 }
 
-fn start_gvproxy() -> Result<u32> {
-    if let Some(pid) = read_pid("gvproxy") {
-        if is_running(pid) {
-            eprintln!("gvproxy already running (pid {pid})");
-            return Ok(pid);
-        }
+fn start_gvproxy(cfg: &Config) -> Result<u32> {
+    if let Some(pid) = read_pid(cfg, "gvproxy")
+        && is_running(pid)
+    {
+        eprintln!("gvproxy already running (pid {pid})");
+        return Ok(pid);
     }
 
-    let dir = work_dir();
+    let dir = cfg.work_dir();
     let sock = dir.join("gvproxy.sock");
-    // Clean up stale socket
     let _ = fs::remove_file(&sock);
 
-    let port = ssh_port();
-    eprintln!("Starting gvproxy (SSH forwarding :{port} -> guest:22)...");
+    eprintln!(
+        "Starting gvproxy (SSH forwarding :{} -> guest:22)...",
+        cfg.ssh_port
+    );
 
     let child = Command::new("gvproxy")
         .args([
             "-listen-vfkit",
             &format!("unixgram://{}", sock.display()),
             "-ssh-port",
-            &port.to_string(),
+            &cfg.ssh_port.to_string(),
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -132,9 +160,8 @@ fn start_gvproxy() -> Result<u32> {
         .context("Failed to start gvproxy")?;
 
     let pid = child.id();
-    write_pid("gvproxy", pid)?;
+    write_pid(cfg, "gvproxy", pid)?;
 
-    // Spawn log forwarders so gvproxy output goes to our stderr
     if let Some(stdout) = child.stdout {
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -150,7 +177,6 @@ fn start_gvproxy() -> Result<u32> {
         });
     }
 
-    // Wait for socket to appear
     let start = Instant::now();
     while !sock.exists() {
         if start.elapsed() > Duration::from_secs(10) {
@@ -163,44 +189,40 @@ fn start_gvproxy() -> Result<u32> {
     Ok(pid)
 }
 
-fn start_krunkit(image: &Path) -> Result<u32> {
-    if let Some(pid) = read_pid("krunkit") {
-        if is_running(pid) {
-            eprintln!("krunkit already running (pid {pid})");
-            return Ok(pid);
-        }
+fn start_krunkit(cfg: &Config, image: &Path) -> Result<u32> {
+    if let Some(pid) = read_pid(cfg, "krunkit")
+        && is_running(pid)
+    {
+        eprintln!("krunkit already running (pid {pid})");
+        return Ok(pid);
     }
 
-    let dir = work_dir();
+    let dir = cfg.work_dir();
     let sock = dir.join("gvproxy.sock");
     let rosetta_dir = "/Library/Apple/usr/libexec/oah";
     let ssh_keys_dir = dir.to_str().unwrap();
 
     eprintln!(
         "Starting krunkit (cores={}, memory={}MiB, image={})...",
-        cores(),
-        memory(),
+        cfg.cores,
+        cfg.memory_mib(),
         image.display()
     );
 
     let child = Command::new("krunkit")
         .args([
             "--cpus",
-            &cores().to_string(),
+            &cfg.cores.to_string(),
             "--mem",
-            &memory().to_string(),
+            &cfg.memory_mib().to_string(),
             "--restful-uri",
             "",
-            // virtiofs: Rosetta runtime
             "--virtiofs",
             &format!("rosetta:{rosetta_dir}"),
-            // virtiofs: SSH keys directory
             "--virtiofs",
             &format!("ssh-keys:{ssh_keys_dir}"),
-            // virtio-net via gvproxy
             "--network",
             &format!("unixgram://{}", sock.display()),
-            // Guest disk image
             image.to_str().unwrap(),
         ])
         .stdout(Stdio::piped())
@@ -209,9 +231,8 @@ fn start_krunkit(image: &Path) -> Result<u32> {
         .context("Failed to start krunkit")?;
 
     let pid = child.id();
-    write_pid("krunkit", pid)?;
+    write_pid(cfg, "krunkit", pid)?;
 
-    // Forward krunkit logs
     if let Some(stdout) = child.stdout {
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -231,9 +252,8 @@ fn start_krunkit(image: &Path) -> Result<u32> {
     Ok(pid)
 }
 
-fn wait_for_ssh() -> Result<()> {
-    let port = ssh_port();
-    let addr = format!("127.0.0.1:{port}");
+fn wait_for_ssh(cfg: &Config) -> Result<()> {
+    let addr = format!("127.0.0.1:{}", cfg.ssh_port);
     eprintln!("Waiting for SSH on {addr}...");
 
     let start = Instant::now();
@@ -243,7 +263,6 @@ fn wait_for_ssh() -> Result<()> {
         if start.elapsed() > timeout {
             bail!("SSH did not become available within 120s");
         }
-        // Quick TCP connect check — faster than spawning ssh
         if TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(2)).is_ok() {
             eprintln!("SSH is reachable on {addr}");
             return Ok(());
@@ -252,41 +271,36 @@ fn wait_for_ssh() -> Result<()> {
     }
 }
 
-fn cmd_start() -> Result<()> {
-    let dir = work_dir();
+fn cmd_start(cfg: &Config) -> Result<()> {
+    let dir = cfg.work_dir();
     fs::create_dir_all(&dir).context("Failed to create working directory")?;
 
-    let image = image_path()?;
-    ensure_ssh_keys()?;
-    start_gvproxy()?;
-    start_krunkit(&image)?;
-    wait_for_ssh()?;
+    let image = cfg.image_path()?;
+    ensure_ssh_keys(cfg)?;
+    start_gvproxy(cfg)?;
+    start_krunkit(cfg, &image)?;
+    wait_for_ssh(cfg)?;
 
     eprintln!("libkrun-builder is ready");
 
     // Keep the daemon alive — launchd expects the process to stay running.
-    // Wait for krunkit to exit (VM shutdown/crash), then exit non-zero
-    // so launchd KeepAlive restarts us.
     loop {
-        if let Some(pid) = read_pid("krunkit") {
-            if !is_running(pid) {
-                eprintln!("krunkit (pid {pid}) exited, shutting down");
-                cmd_stop()?;
-                bail!("krunkit exited unexpectedly");
-            }
+        if let Some(pid) = read_pid(cfg, "krunkit")
+            && !is_running(pid)
+        {
+            eprintln!("krunkit (pid {pid}) exited, shutting down");
+            cmd_stop(cfg)?;
+            bail!("krunkit exited unexpectedly");
         }
         thread::sleep(Duration::from_secs(5));
     }
 }
 
-fn kill_pid(name: &str) {
-    if let Some(pid) = read_pid(name) {
+fn kill_pid(cfg: &Config, name: &str) {
+    if let Some(pid) = read_pid(cfg, name) {
         if is_running(pid) {
             eprintln!("Stopping {name} (pid {pid})...");
-            let _ = Command::new("kill")
-                .arg(pid.to_string())
-                .status();
-            // Wait up to 5s for graceful exit
+            let _ = Command::new("kill").arg(pid.to_string()).status();
             let start = Instant::now();
             while is_running(pid) && start.elapsed() < Duration::from_secs(5) {
                 thread::sleep(Duration::from_millis(200));
@@ -298,21 +312,26 @@ fn kill_pid(name: &str) {
                     .status();
             }
         }
-        let _ = fs::remove_file(pid_path(name));
+        let _ = fs::remove_file(pid_path(cfg, name));
     }
 }
 
-fn cmd_stop() -> Result<()> {
-    // Try graceful SSH poweroff first
-    let port = ssh_port();
+fn cmd_stop(cfg: &Config) -> Result<()> {
     eprintln!("Attempting graceful shutdown via SSH...");
     let _ = Command::new("ssh")
         .args([
-            "-o", "ConnectTimeout=3",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            "-p", &port.to_string(),
-            "-i", &work_dir().join("ssh_host_ed25519_key").to_string_lossy(),
+            "-o",
+            "ConnectTimeout=3",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-p",
+            &cfg.ssh_port.to_string(),
+            "-i",
+            &cfg.work_dir()
+                .join("ssh_host_ed25519_key")
+                .to_string_lossy(),
             "root@127.0.0.1",
             "poweroff",
         ])
@@ -320,23 +339,21 @@ fn cmd_stop() -> Result<()> {
         .stderr(Stdio::null())
         .status();
 
-    // Give the VM a few seconds to shut down
     thread::sleep(Duration::from_secs(3));
 
-    kill_pid("krunkit");
-    kill_pid("gvproxy");
+    kill_pid(cfg, "krunkit");
+    kill_pid(cfg, "gvproxy");
 
-    // Clean up socket
-    let _ = fs::remove_file(work_dir().join("gvproxy.sock"));
+    let _ = fs::remove_file(cfg.work_dir().join("gvproxy.sock"));
 
     eprintln!("libkrun-builder stopped");
     Ok(())
 }
 
-fn cmd_status() -> Result<()> {
+fn cmd_status(cfg: &Config) -> Result<()> {
     let mut running = true;
 
-    if let Some(pid) = read_pid("gvproxy") {
+    if let Some(pid) = read_pid(cfg, "gvproxy") {
         if is_running(pid) {
             println!("gvproxy: running (pid {pid})");
         } else {
@@ -348,7 +365,7 @@ fn cmd_status() -> Result<()> {
         running = false;
     }
 
-    if let Some(pid) = read_pid("krunkit") {
+    if let Some(pid) = read_pid(cfg, "krunkit") {
         if is_running(pid) {
             println!("krunkit: running (pid {pid})");
         } else {
@@ -360,8 +377,7 @@ fn cmd_status() -> Result<()> {
         running = false;
     }
 
-    let port = ssh_port();
-    let addr = format!("127.0.0.1:{port}");
+    let addr = format!("127.0.0.1:{}", cfg.ssh_port);
     let ssh_ok = TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(2)).is_ok();
     if ssh_ok {
         println!("ssh: reachable on {addr}");
@@ -384,17 +400,25 @@ fn main() -> Result<()> {
     let cmd = args.get(1).map(String::as_str).unwrap_or("help");
 
     match cmd {
-        "start" => cmd_start(),
-        "stop" => cmd_stop(),
-        "status" => cmd_status(),
+        "start" | "stop" | "status" => {
+            let cfg = Config::load()?;
+            eprintln!("Config: {:?}", cfg);
+            match cmd {
+                "start" => cmd_start(&cfg),
+                "stop" => cmd_stop(&cfg),
+                "status" => cmd_status(&cfg),
+                _ => unreachable!(),
+            }
+        }
         _ => {
             eprintln!("Usage: libkrun-builder <start|stop|status>");
             eprintln!();
-            eprintln!("Environment variables:");
-            eprintln!("  LIBKRUN_IMAGE    Path to NixOS guest qcow2 image (required for start)");
+            eprintln!("Configuration (Figment: defaults -> YAML -> env vars):");
+            eprintln!("  Config file: LIBKRUN_CONFIG (default: /etc/libkrun-builder/config.yaml)");
+            eprintln!("  LIBKRUN_IMAGE    Path to NixOS guest qcow2 image");
             eprintln!("  LIBKRUN_WORKDIR  Working directory (default: /var/lib/libkrun-builder)");
             eprintln!("  LIBKRUN_CORES    CPU cores for VM (default: 6)");
-            eprintln!("  LIBKRUN_MEMORY   Memory for VM in MiB or 'NGiB' (default: 8192)");
+            eprintln!("  LIBKRUN_MEMORY   Memory for VM, e.g. '8GiB' (default: 8GiB)");
             eprintln!("  LIBKRUN_SSH_PORT SSH port forwarding (default: 31122)");
             std::process::exit(if cmd == "help" { 0 } else { 1 });
         }

@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+figment = { version = "0.10", features = ["env", "yaml"] }
+serde = { version = "1", features = ["derive"] }
