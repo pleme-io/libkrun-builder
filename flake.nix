@@ -19,6 +19,11 @@
       inputs.fenix.follows = "fenix";
     };
 
+    devenv = {
+      url = "github:cachix/devenv";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
     # Separate nixpkgs for the NixOS guest image — must NOT be followed
     # so it matches upstream cache.nixos.org and packages are fetched, not built.
     # The nix-rosetta-builder had the same design: "Does NOT follow our nixpkgs —
@@ -33,10 +38,11 @@
     crate2nix,
     flake-utils,
     substrate,
+    devenv,
     ...
   }:
     (import "${substrate}/lib/rust-tool-release-flake.nix" {
-      inherit nixpkgs crate2nix flake-utils;
+      inherit nixpkgs crate2nix flake-utils devenv;
     }) {
       toolName = "libkrun-builder";
       src = self;
