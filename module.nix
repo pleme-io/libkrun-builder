@@ -43,8 +43,8 @@ in {
     };
 
     guestImage = mkOption {
-      type = types.path;
-      description = "Path to the NixOS guest qcow2 image.";
+      type = types.str;
+      description = "Path to the NixOS guest qcow2 image (runtime path, not imported into store).";
     };
 
     package = mkOption {
