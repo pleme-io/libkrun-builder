@@ -213,7 +213,7 @@ fn start_krunkit(cfg: &Config, image: &Path) -> Result<u32> {
         .args([
             "--cpus",
             &cfg.cores.to_string(),
-            "--mem",
+            "--memory",
             &cfg.memory_mib().to_string(),
             "--restful-uri",
             "",
